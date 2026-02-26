@@ -1,3 +1,7 @@
+## [0.1.2] - 2026-02-26
+### Fixed
+- 自动修复 CI 失败（run 22429021446）：限制 Vitest 仅运行 TypeScript 测试文件，避免 CommonJS 导入冲突。
+
 # Changelog
 
 ## [0.1.1] - 2026-02-26

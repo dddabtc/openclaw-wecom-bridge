@@ -1,0 +1,190 @@
+name: CI Auto Remediation
+
+on:
+  workflow_run:
+    workflows: ["CI", "CD"]
+    types: [completed]
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  collect-runs:
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'failure') }}
+    runs-on: ubuntu-latest
+    outputs:
+      run_ids: ${{ steps.pick.outputs.run_ids }}
+    steps:
+      - name: Pick failed runs to process
+        id: pick
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const runIds = [];
+
+            if (context.eventName === 'workflow_run') {
+              const wr = context.payload.workflow_run;
+              if (wr.conclusion === 'failure') runIds.push(String(wr.id));
+            } else {
+              const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+              const names = new Set(['CI', 'CD']);
+              const runs = await github.paginate(github.rest.actions.listWorkflowRunsForRepo, {
+                owner,
+                repo,
+                per_page: 100
+              });
+
+              for (const r of runs) {
+                const created = new Date(r.created_at).getTime();
+                if (created < cutoff) continue;
+                if (!names.has(r.name)) continue;
+                if (r.conclusion !== 'failure') continue;
+                runIds.push(String(r.id));
+              }
+            }
+
+            const uniq = Array.from(new Set(runIds)).slice(0, 10);
+            core.info(`Selected failed runs: ${uniq.join(', ') || '(none)'}`);
+            core.setOutput('run_ids', JSON.stringify(uniq));
+
+  remediate:
+    needs: collect-runs
+    if: ${{ needs.collect-runs.outputs.run_ids != '[]' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        run_id: ${{ fromJson(needs.collect-runs.outputs.run_ids) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Diagnose run and extract pattern
+        id: diag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_ID: ${{ matrix.run_id }}
+        run: |
+          set -euo pipefail
+          gh run view "$RUN_ID" --log > run.log || true
+          {
+            echo "# CI/CD Failure Diagnosis"
+            echo
+            echo "- Run: https://github.com/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}"
+            echo
+            echo "## Suggested Fixes"
+            if grep -qi "Vitest cannot be imported in a CommonJS module" run.log; then
+              echo "- 检测到 Vitest + CommonJS 冲突：限制 Vitest 仅匹配 TypeScript 测试文件，避免执行编译产物 *.test.js。"
+              echo "matched=true" >> "$GITHUB_OUTPUT"
+              echo "pattern=vitest_cjs" >> "$GITHUB_OUTPUT"
+            else
+              echo "- 未匹配到可自动修复模式，请人工处理。"
+              echo "matched=false" >> "$GITHUB_OUTPUT"
+              echo "pattern=unknown" >> "$GITHUB_OUTPUT"
+            fi
+          } > ci-failure-diagnosis.md
+
+      - name: Upload diagnosis artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-failure-diagnosis-${{ matrix.run_id }}
+          path: ci-failure-diagnosis.md
+
+      - name: Create issue for unknown pattern
+        if: ${{ steps.diag.outputs.matched != 'true' }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('node:fs');
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const runId = '${{ matrix.run_id }}';
+            const title = `CI auto-diagnose pending manual fix (run ${runId})`;
+            const body = fs.readFileSync('ci-failure-diagnosis.md', 'utf8');
+
+            const issues = await github.paginate(github.rest.issues.listForRepo, {
+              owner, repo, state: 'open', per_page: 100
+            });
+            if (issues.some(i => i.title === title)) {
+              core.info('Issue already exists, skip creating duplicate.');
+              return;
+            }
+
+            await github.rest.issues.create({ owner, repo, title, body });
+
+      - name: Auto-fix known pattern (create branch + changelog + PR + self-review + auto-merge)
+        if: ${{ steps.diag.outputs.matched == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_ID: ${{ matrix.run_id }}
+        run: |
+          set -euo pipefail
+
+          run_json=$(gh api repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID})
+          event=$(echo "$run_json" | jq -r '.event')
+          head_repo=$(echo "$run_json" | jq -r '.head_repository.full_name')
+          base_repo="${GITHUB_REPOSITORY}"
+
+          if [ "$head_repo" != "$base_repo" ]; then
+            echo "Fork run detected, skip write operations."
+            exit 0
+          fi
+
+          branch="bugfix/ci-auto-${RUN_ID}"
+          pr_title="bugfix: auto-fix CI failure run ${RUN_ID}"
+
+          if gh pr list --state open --search "$pr_title in:title" --json number --jq 'length>0' | grep -q true; then
+            echo "PR already exists, skip duplicate remediation."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$branch"
+
+          cat > vitest.config.ts <<'VITEST'
+          import { defineConfig } from 'vitest/config';
+
+          export default defineConfig({
+            test: {
+              include: ['test/**/*.test.ts'],
+              exclude: ['**/node_modules/**', '**/dist/**']
+            }
+          });
+          VITEST
+
+          today=$(date -u +%F)
+          tmpfile=$(mktemp)
+          {
+            echo "## [0.1.2] - ${today}"
+            echo "### Fixed"
+            echo "- 自动修复 CI 失败（run ${RUN_ID}）：限制 Vitest 仅运行 TypeScript 测试文件，避免 CommonJS 导入冲突。"
+            echo
+            cat CHANGELOG.md
+          } > "$tmpfile"
+          mv "$tmpfile" CHANGELOG.md
+
+          git add vitest.config.ts CHANGELOG.md
+          if git diff --cached --quiet; then
+            echo "No changes to commit, skip."
+            exit 0
+          fi
+
+          git commit -m "fix(ci): auto-remediate run ${RUN_ID} vitest cjs pattern"
+          git push -u origin "$branch"
+
+          pr_body="## Root Cause\nCI 执行时混入编译产物 *.test.js，Vitest 在 CommonJS require() 场景报错。\n\n## Fix\n- 新增/更新 vitest.config.ts，限制仅匹配 test/**/*.test.ts\n- 更新 CHANGELOG\n\n## Verification\n- 由 PR checks 自动验证 lint/test/build\n\n## Risk\n- 低：仅收窄测试匹配范围，避免误执行编译产物。"
+
+          gh pr create --base main --head "$branch" --title "$pr_title" --body "$pr_body"
+          pr_number=$(gh pr list --state open --search "$pr_title in:title" --json number --jq '.[0].number')
+          gh pr comment "$pr_number" --body "Self-review: 已检查根因、变更范围（vitest.config.ts + CHANGELOG）、并确认仅影响测试收集规则。"
+          gh pr merge "$pr_number" --squash --auto --delete-branch

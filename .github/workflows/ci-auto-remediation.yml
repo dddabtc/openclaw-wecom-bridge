@@ -139,7 +139,8 @@ jobs:
             exit 0
           fi
 
-          branch="bugfix/ci-auto-${RUN_ID}"
+          # Use unique branch per remediation workflow run to avoid non-fast-forward conflicts
+          branch="bugfix/ci-auto-${RUN_ID}-${GITHUB_RUN_ID}"
           pr_title="bugfix: auto-fix CI failure run ${RUN_ID}"
 
           if gh pr list --state open --search "$pr_title in:title" --json number --jq 'length>0' | grep -q true; then
